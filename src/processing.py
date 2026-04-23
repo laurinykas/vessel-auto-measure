@@ -648,14 +648,16 @@ class VesselProcessor:
         if options.get('show_labels', False) and self.result.stats:
             stats = self.result.stats
             means = stats.get('mean', [0, 0, 0, 0])
+            avr = self.result.avr or {}
+            avr_top = avr.get('top', 0)
+            avr_btm = avr.get('bottom', 0)
 
-            # Tekstų paruošimas
             artt = f"Artery = {means[0]:.2f}px" if means[0] != 0 else "Artery = -"
             vnt = f"Vein = {means[1]:.2f}px" if means[1] != 0 else "Vein = -"
-            rtt = f"Ratio = {means[0] / means[1]:.4f}" if means[0] != 0 and means[1] != 0 else "Ratio = -"
+            rtt = f"AVR = {avr_top:.4f}" if avr_top > 0 else "AVR = -"
             artb = f"Artery = {means[2]:.2f}px" if means[2] != 0 else "Artery = -"
             vnb = f"Vein = {means[3]:.2f}px" if means[3] != 0 else "Vein = -"
-            rtb = f"Ratio = {means[2] / means[3]:.4f}" if means[2] != 0 and means[3] != 0 else "Ratio = -"
+            rtb = f"AVR = {avr_btm:.4f}" if avr_btm > 0 else "AVR = -"
 
             cv2.rectangle(result, (1, 1), (400, 170), (255, 255, 255), -1)
 
@@ -775,8 +777,9 @@ class VesselProcessor:
                     return f"{m['width']:.4f};{m['x']:.1f};{m['y']:.1f}"
                 return "-;-;-"
 
-            top_ratio = means[0] / means[1] if means[0] > 0 and means[1] > 0 else -1
-            btm_ratio = means[2] / means[3] if means[2] > 0 and means[3] > 0 else -1
+            avr = self.result.avr or {}
+            top_ratio = avr.get('top', 0) if avr.get('top', 0) > 0 else -1
+            btm_ratio = avr.get('bottom', 0) if avr.get('bottom', 0) > 0 else -1
 
             line = f"{filename};"
             line += fmt(artery_tm) + ";"
