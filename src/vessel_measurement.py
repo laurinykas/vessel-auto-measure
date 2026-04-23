@@ -1506,10 +1506,48 @@ def measure_od_points(od_x: int, od_y: int, od_r: int,
 # =============================================================================
 # KLASIFIKACIJA
 
+def _stable_kmeans_av(points: np.ndarray, widths: List[float], dims: int,
+                       n_seeds: int = 5) -> Tuple[np.ndarray, int]:
+    """
+    Stabilus k-means su voting ir width tiebreaker A/V priskyrimui.
+    Grąžina (final_labels, artery_cluster_idx) kur artery_cluster_idx yra 0 arba 1.
+    """
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.0001)
+    n = len(points)
+    vote_labels = np.zeros((n_seeds, n), dtype=np.int32)
+    vote_art = np.zeros(n_seeds, dtype=np.int32)
+
+    for s in range(n_seeds):
+        cv2.setRNGSeed(42 + s * 17)
+        _, labels, centers = cv2.kmeans(points, 2, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+        labels_flat = labels.flatten()
+        sum0 = sum(centers[0, k] for k in range(dims))
+        sum1 = sum(centers[1, k] for k in range(dims))
+
+        if abs(sum0 - sum1) < 0.1:
+            w0 = np.mean([widths[i] for i in range(n) if labels_flat[i] == 0]) if np.any(labels_flat == 0) else 0
+            w1 = np.mean([widths[i] for i in range(n) if labels_flat[i] == 1]) if np.any(labels_flat == 1) else 0
+            art_cluster = 0 if w0 < w1 else 1
+        else:
+            art_cluster = 0 if sum0 > sum1 else 1
+
+        vote_labels[s] = labels_flat
+        vote_art[s] = art_cluster
+
+    canonical = np.where(vote_art[:, None] == vote_labels, 1, 0)
+    final_art_mask = (canonical.sum(axis=0) > n_seeds / 2).astype(np.int32)
+    most_common_art_cluster = int(np.argmax(np.bincount(vote_art)))
+    final_labels = np.where(final_art_mask == 1, most_common_art_cluster, 1 - most_common_art_cluster)
+
+    return final_labels, most_common_art_cluster
+
+
 def classifyVessels(vslsave: List[List[float]], od_x: int, od_y: int,
                     od_r: int = 100,
                     class_sel: List[int] = CLASS_SEL,
-                    segment_counts: List[int] = None) -> dict:
+                    segment_counts: List[int] = None,
+                    norm_method: str = 'spatial',
+                    kmeans_method: str = 'stable') -> dict:
     """
     Klasifikuoja kraujagysles į arterijas ir venas.
 
@@ -1597,64 +1635,131 @@ def classifyVessels(vslsave: List[List[float]], od_x: int, od_y: int,
     points_top = np.ones((max(num_top, 1), dims), dtype=np.float32) if num_top > 0 else None
 
     # =========================================================================
-    # ERDVINIS NORMALIZAVIMAS
-    for i in range(sz):
-        #gauti artimiausių kaimynų indeksus (ĮSKAITANT PATĮ)
-        nni = getNN(distm, i, nn, sz)
+    # NORMALIZAVIMAS
+    if norm_method == 'zscore':
+        # Paprastas z-score
+        arr = np.array(vsl_vals, dtype=np.float64)
+        means = arr.mean(axis=0)
+        sds = arr.std(axis=0)
+        sds[sds == 0] = 1.0
 
-        #  inicializuoti
-        vsl_sums = [0.0] * dims
-        vsl_means = [0.0] * dims
-        vsl_sds = [0.0] * dims
-        sumds = 0.0
-
-        # apskaičiuoti sumas
-        for j in range(len(nni)):
-            crd = distm[i, nni[j]]
-            if crd == 0:
-                crd = 1
-            sumds += 1.0 / crd
-
+        for i in range(sz):
             for k in range(dims):
-                vsl_sums[k] += vsl_vals[nni[j]][k] / crd
+                val = (vsl_vals[i][k] - means[k]) / sds[k]
+                points[i, k] = val
+                if crdy[i] > od_y:
+                    if points_btm is not None:
+                        points_btm[tb_idx[i], k] = val
+                else:
+                    if points_top is not None:
+                        points_top[tt_idx[i], k] = val
 
-        #  vidurkiai
-        for k in range(dims):
-            vsl_means[k] = vsl_sums[k] / sumds if sumds > 0 else 0
-
-        # standartiniai nuokrypiai
-        for j in range(len(nni)):
-            crd = distm[i, nni[j]]
-            if crd == 0:
-                crd = 1
-
+    elif norm_method == 'spatial_noself':
+        for i in range(sz):
+            nni = getNN(distm, i, nn, sz)
+            vsl_sums = [0.0] * dims
+            vsl_means = [0.0] * dims
+            vsl_sds = [0.0] * dims
+            sumds = 0.0
+            for j in range(len(nni)):
+                if nni[j] == i:
+                    continue
+                crd = distm[i, nni[j]]
+                if crd == 0:
+                    crd = 1
+                sumds += 1.0 / crd
+                for k in range(dims):
+                    vsl_sums[k] += vsl_vals[nni[j]][k] / crd
             for k in range(dims):
-                vsl_sds[k] += (vsl_vals[nni[j]][k] / crd - vsl_means[k])**2
+                vsl_means[k] = vsl_sums[k] / sumds if sumds > 0 else 0
+            for j in range(len(nni)):
+                if nni[j] == i:
+                    continue
+                crd = distm[i, nni[j]]
+                if crd == 0:
+                    crd = 1
+                for k in range(dims):
+                    vsl_sds[k] += (vsl_vals[nni[j]][k] / crd - vsl_means[k])**2
+            for k in range(dims):
+                vsl_sds[k] = math.sqrt(vsl_sds[k] / sumds) if sumds > 0 else 1.0
+            for k in range(dims):
+                if vsl_sds[k] > 0:
+                    val = (vsl_vals[i][k] - vsl_means[k]) / vsl_sds[k]
+                else:
+                    val = 0.0
+                points[i, k] = val
+                if crdy[i] > od_y:
+                    if points_btm is not None:
+                        points_btm[tb_idx[i], k] = val
+                else:
+                    if points_top is not None:
+                        points_top[tt_idx[i], k] = val
 
-        for k in range(dims):
-            vsl_sds[k] = math.sqrt(vsl_sds[k] / sumds) if sumds > 0 else 1.0
-
-        # normalizuoti
-        for k in range(dims):
-            if vsl_sds[k] > 0:
-                val = (vsl_vals[i][k] - vsl_means[k]) / vsl_sds[k]
-            else:
-                val = 0.0
-
-            points[i, k] = val
-
-            if crdy[i] > od_y:
-                if points_btm is not None:
-                    points_btm[tb_idx[i], k] = val
-            else:
-                if points_top is not None:
-                    points_top[tt_idx[i], k] = val
+    else:  # 'spatial' — originalus erdvinis (formulės 24-26)
+        for i in range(sz):
+            nni = getNN(distm, i, nn, sz)
+            vsl_sums = [0.0] * dims
+            vsl_means = [0.0] * dims
+            vsl_sds = [0.0] * dims
+            sumds = 0.0
+            for j in range(len(nni)):
+                crd = distm[i, nni[j]]
+                if crd == 0:
+                    crd = 1
+                sumds += 1.0 / crd
+                for k in range(dims):
+                    vsl_sums[k] += vsl_vals[nni[j]][k] / crd
+            for k in range(dims):
+                vsl_means[k] = vsl_sums[k] / sumds if sumds > 0 else 0
+            for j in range(len(nni)):
+                crd = distm[i, nni[j]]
+                if crd == 0:
+                    crd = 1
+                for k in range(dims):
+                    vsl_sds[k] += (vsl_vals[nni[j]][k] / crd - vsl_means[k])**2
+            for k in range(dims):
+                vsl_sds[k] = math.sqrt(vsl_sds[k] / sumds) if sumds > 0 else 1.0
+            for k in range(dims):
+                if vsl_sds[k] > 0:
+                    val = (vsl_vals[i][k] - vsl_means[k]) / vsl_sds[k]
+                else:
+                    val = 0.0
+                points[i, k] = val
+                if crdy[i] > od_y:
+                    if points_btm is not None:
+                        points_btm[tb_idx[i], k] = val
+                else:
+                    if points_top is not None:
+                        points_top[tt_idx[i], k] = val
 
     # =========================================================================
     #  K-MEANS KLASIFIKACIJA
     vsl_class = []
 
-    if len(vsl_wd) > 1:
+    if kmeans_method == 'threshold_m1':
+        m1_feat_idx = class_sel.index(5) if 5 in class_sel else 0
+        for i in range(sz):
+            val = points[i, m1_feat_idx]
+            measure_type = 1 if val > 0 else 2
+            if crdy[i] > od_y:
+                measure_type += 2
+            vsl_class.append(measure_type)
+
+    elif kmeans_method == 'threshold_m1_median':
+        m1_feat_idx = class_sel.index(5) if 5 in class_sel else 0
+        top_vals = [points[i, m1_feat_idx] for i in range(sz) if crdy[i] <= od_y]
+        btm_vals = [points[i, m1_feat_idx] for i in range(sz) if crdy[i] > od_y]
+        top_thr = float(np.median(top_vals)) if len(top_vals) > 0 else 0.0
+        btm_thr = float(np.median(btm_vals)) if len(btm_vals) > 0 else 0.0
+        for i in range(sz):
+            val = points[i, m1_feat_idx]
+            if crdy[i] > od_y:
+                measure_type = 3 if val > btm_thr else 4
+            else:
+                measure_type = 1 if val > top_thr else 2
+            vsl_class.append(measure_type)
+
+    elif len(vsl_wd) > 1:
         # jei tik viena pusė ARBA per mažai taškų k-means
         # K-means su k=2 reikalauja bent 2 taškų kiekvienoje grupėje
         if num_top < 2 or num_btm < 2:
@@ -1663,66 +1768,75 @@ def classifyVessels(vslsave: List[List[float]], od_x: int, od_y: int,
 
             # Patikrinti ar turime bent 2 taškus iš viso
             if len(points) < 2:
-                # Per mažai taškų - priskirti pagal poziciją
                 vsl_class = [1 if crdy[i] <= od_y else 3 for i in range(sz)]
             else:
-                _, labels, centers = cv2.kmeans(points, 2, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+                if kmeans_method == 'stable':
+                    labels_flat, art_cluster = _stable_kmeans_av(points, vsl_wd, dims)
+                    for i in range(sz):
+                        measure_type = 1 if labels_flat[i] == art_cluster else 2
+                        if crdy[i] > od_y:
+                            measure_type += 2
+                        vsl_class.append(measure_type)
+                else:
+                    _, labels, centers = cv2.kmeans(points, 2, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
 
-                sum1 = sum(centers[0, k] for k in range(dims))
-                sum2 = sum(centers[1, k] for k in range(dims))
+                    sum1 = sum(centers[0, k] for k in range(dims))
+                    sum2 = sum(centers[1, k] for k in range(dims))
 
-                for i in range(sz):
-                    clusterIdx = int(labels[i, 0])
+                    for i in range(sz):
+                        clusterIdx = int(labels[i, 0])
 
-                    measure_type = 1  # arterija
-                    # jei vena
-                    if (clusterIdx == 0 and sum1 < sum2) or (clusterIdx == 1 and sum2 <= sum1):
-                        measure_type = 2
-
-                    #  jei apatinė
-                    if crdy[i] > od_y:
-                        measure_type += 2
-
-                    vsl_class.append(measure_type)
-        else:
-            #  atskira klasifikacija viršutiniams ir apatiniams
-            try:
-                # Viršutiniai
-                criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.0001)
-                _, labels_top, centers_top = cv2.kmeans(points_top[:num_top], 2, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
-
-                # Apatiniai
-                _, labels_btm, centers_btm = cv2.kmeans(points_btm[:num_btm], 2, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
-
-                # Validuoti centrų dimensijas
-                if centers_top.shape[1] != dims or centers_btm.shape[1] != dims:
-                    raise ValueError(f"Invalid centers shape: top={centers_top.shape}, btm={centers_btm.shape}, expected dims={dims}")
-
-                #  centrų sumos
-                sum1t = sum(centers_top[0, k] for k in range(dims))
-                sum2t = sum(centers_top[1, k] for k in range(dims))
-                sum1b = sum(centers_btm[0, k] for k in range(dims))
-                sum2b = sum(centers_btm[1, k] for k in range(dims))
-
-                # priskirti klases
-                for i in range(sz):
-                    if tbt_idt[i] == 0:
-                        # Viršutinis
                         measure_type = 1
-                        clusterIdx = int(labels_top[tt_idx[i], 0])
-                        if (clusterIdx == 0 and sum1t < sum2t) or (clusterIdx == 1 and sum2t <= sum1t):
+                        if (clusterIdx == 0 and sum1 < sum2) or (clusterIdx == 1 and sum2 <= sum1):
                             measure_type = 2
-                    else:
-                        # Apatinis
-                        measure_type = 3
-                        clusterIdx = int(labels_btm[tb_idx[i], 0])
-                        if (clusterIdx == 0 and sum1b < sum2b) or (clusterIdx == 1 and sum2b <= sum1b):
-                            measure_type = 4
 
-                    vsl_class.append(measure_type)
+                        if crdy[i] > od_y:
+                            measure_type += 2
+
+                        vsl_class.append(measure_type)
+        else:
+            try:
+                criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.0001)
+
+                if kmeans_method == 'stable':
+                    wd_top = [vsl_wd[i] for i in range(sz) if tbt_idt[i] == 0]
+                    wd_btm = [vsl_wd[i] for i in range(sz) if tbt_idt[i] == 1]
+                    labels_top_flat, art_top = _stable_kmeans_av(points_top[:num_top], wd_top, dims)
+                    labels_btm_flat, art_btm = _stable_kmeans_av(points_btm[:num_btm], wd_btm, dims)
+
+                    for i in range(sz):
+                        if tbt_idt[i] == 0:
+                            measure_type = 1 if labels_top_flat[tt_idx[i]] == art_top else 2
+                        else:
+                            measure_type = 3 if labels_btm_flat[tb_idx[i]] == art_btm else 4
+                        vsl_class.append(measure_type)
+                else:
+                    _, labels_top, centers_top = cv2.kmeans(points_top[:num_top], 2, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+                    _, labels_btm, centers_btm = cv2.kmeans(points_btm[:num_btm], 2, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+
+                    if centers_top.shape[1] != dims or centers_btm.shape[1] != dims:
+                        raise ValueError(f"Invalid centers shape: top={centers_top.shape}, btm={centers_btm.shape}, expected dims={dims}")
+
+                    sum1t = sum(centers_top[0, k] for k in range(dims))
+                    sum2t = sum(centers_top[1, k] for k in range(dims))
+                    sum1b = sum(centers_btm[0, k] for k in range(dims))
+                    sum2b = sum(centers_btm[1, k] for k in range(dims))
+
+                    for i in range(sz):
+                        if tbt_idt[i] == 0:
+                            measure_type = 1
+                            clusterIdx = int(labels_top[tt_idx[i], 0])
+                            if (clusterIdx == 0 and sum1t < sum2t) or (clusterIdx == 1 and sum2t <= sum1t):
+                                measure_type = 2
+                        else:
+                            measure_type = 3
+                            clusterIdx = int(labels_btm[tb_idx[i], 0])
+                            if (clusterIdx == 0 and sum1b < sum2b) or (clusterIdx == 1 and sum2b <= sum1b):
+                                measure_type = 4
+
+                        vsl_class.append(measure_type)
 
             except Exception as e:
-                # Fallback: priskirti klases pagal poziciją
                 vsl_class = [1 if crdy[i] <= od_y else 3 for i in range(sz)]
 
     # Jei klasifikacija nepavyko, priskirti numatytąsias klases

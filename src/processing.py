@@ -362,7 +362,9 @@ class VesselProcessor:
         classification = classifyVessels(
             vslsave,
             self.result.od_x,
-            self.result.od_y
+            self.result.od_y,
+            norm_method='spatial_noself',
+            kmeans_method='kmeans'
         )
 
         self.result.classification = classification
